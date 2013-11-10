@@ -1,3 +1,4 @@
+var extend = require('extend');
 
 // MemoryStore
 // ============
@@ -420,8 +421,15 @@ function hoodieMemoryStore (hoodie, options) {
   // Otherwise it returns `true` or `false` for the passed object. An object is dirty
   // if it has no `_syncedAt` attribute or if `updatedAt` is more recent than `_syncedAt`
   store.hasLocalChanges = function(type, id) {
+    function isEmptyObject (obj) {
+      for (var key in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) return false;
+      }
+      return true;
+    }
+
     if (!type) {
-      return !$.isEmptyObject(dirty);
+      return !isEmptyObject(dirty);
     }
     var key = [type,id].join('/');
     if (dirty[key]) {
@@ -491,14 +499,14 @@ function hoodieMemoryStore (hoodie, options) {
     key = '' + type + '/' + id;
 
     if (object) {
-      $.extend(object, {
+      extend(object, {
         type: type,
         id: id
       });
 
       if (options.remote) {
         clearChanged(type, id);
-        cachedObject[key] = $.extend(true, {}, object);
+        cachedObject[key] = extend(true, {}, object);
         return cachedObject[key];
       }
 
@@ -515,7 +523,7 @@ function hoodieMemoryStore (hoodie, options) {
       // if key is cached, return it. But make sure
       // to make a deep copy beforehand (=> true)
       if (cachedObject[key]) {
-        return $.extend(true, {}, cachedObject[key]);
+        return extend(true, {}, cachedObject[key]);
       }
 
       // stop here if object did not exist
@@ -536,7 +544,7 @@ function hoodieMemoryStore (hoodie, options) {
 
     // here is where we cache the object for
     // future quick access
-    cachedObject[key] = $.extend(true, {}, object);
+    cachedObject[key] = extend(true, {}, object);
 
     if (hasLocalChanges(object)) {
       markAsChanged(type, id, cachedObject[key], options);
@@ -544,7 +552,7 @@ function hoodieMemoryStore (hoodie, options) {
       clearChanged(type, id);
     }
 
-    return $.extend(true, {}, object);
+    return extend(true, {}, object);
   }
 
 
@@ -688,11 +696,11 @@ function hoodieMemoryStore (hoodie, options) {
   // this is where all the store events get triggered,
   // like add:task, change:note:abc4567, remove, etc.
   function triggerEvents(eventName, object, options) {
-    store.trigger(eventName, $.extend(true, {}, object), options);
-    store.trigger(object.type + ':' + eventName, $.extend(true, {}, object), options);
+    store.trigger(eventName, extend(true, {}, object), options);
+    store.trigger(object.type + ':' + eventName, extend(true, {}, object), options);
 
     if (eventName !== 'new') {
-      store.trigger( object.type + ':' + object.id+ ':' + eventName, $.extend(true, {}, object), options);
+      store.trigger( object.type + ':' + object.id+ ':' + eventName, extend(true, {}, object), options);
     }
 
     // sync events have no changes, so we don't trigger
@@ -701,11 +709,11 @@ function hoodieMemoryStore (hoodie, options) {
       return;
     }
 
-    store.trigger('change', eventName, $.extend(true, {}, object), options);
-    store.trigger(object.type + ':change', eventName, $.extend(true, {}, object), options);
+    store.trigger('change', eventName, extend(true, {}, object), options);
+    store.trigger(object.type + ':change', eventName, extend(true, {}, object), options);
 
     if (eventName !== 'new') {
-      store.trigger(object.type + ':' + object.id + ':change', eventName, $.extend(true, {}, object), options);
+      store.trigger(object.type + ':' + object.id + ':change', eventName, extend(true, {}, object), options);
     }
   }
 

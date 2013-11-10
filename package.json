@@ -3,7 +3,8 @@
   "version": "0.0.0",
   "description": "Stores stuff in memory, optionally syncs to the passed remote store.",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "browserify": "browserify store.js > hoodie.memory-store.js"
   },
   "repository": {
     "type": "git",
@@ -19,5 +20,11 @@
   "license": "Apache",
   "bugs": {
     "url": "https://github.com/alanshaw/hoodie-plugin-memory-store/issues"
+  },
+  "dependencies": {
+    "extend": "~1.2.1"
+  },
+  "devDependencies": {
+    "browserify": "~2.35.1"
   }
 }
