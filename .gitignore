@@ -1,0 +1,4 @@
+node_modules
+*.iml
+.idea
+hoodie.memory-store.js

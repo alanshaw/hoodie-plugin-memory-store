@@ -1,0 +1,23 @@
+{
+  "name": "hoodie-plugin-memory-store",
+  "version": "0.0.0",
+  "description": "Stores stuff in memory, optionally syncs to the passed remote store.",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/alanshaw/hoodie-plugin-memory-store.git"
+  },
+  "keywords": [
+    "store",
+    "memory",
+    "flash",
+    "temporary"
+  ],
+  "author": "Alan Shaw",
+  "license": "Apache",
+  "bugs": {
+    "url": "https://github.com/alanshaw/hoodie-plugin-memory-store/issues"
+  }
+}
