@@ -4,7 +4,7 @@
   "description": "Stores stuff in memory, optionally syncs to the passed remote store.",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "browserify": "browserify store.js > hoodie.memory-store.js"
+    "browserify": "browserify memory_store.js > hoodie.memory-store.js"
   },
   "repository": {
     "type": "git",

@@ -1,781 +1,413 @@
-var extend = require('extend');
+var hoodieScopedStoreApi = require('./scoped_store');
 
-// MemoryStore
+// Store
 // ============
+
+// This class defines the API that hoodie.store (local store) and hoodie.open
+// (remote store) implement to assure a coherent API. It also implements some
+// basic validations.
 //
-// Stores stuff in memory, optionally syncs to the passed remote store
+// The returned API provides the following methods:
+//
+// * validate
+// * save
+// * add
+// * find
+// * findOrAdd
+// * findAll
+// * update
+// * updateAll
+// * remove
+// * removeAll
+// * decoratePromises
+// * trigger
+// * on
+// * unbind
+//
+// At the same time, the returned API can be called as function returning a
+// store scoped by the passed type, for example
+//
+//     var taskStore = hoodie.store('task');
+//     taskStore.findAll().then( showAllTasks );
+//     taskStore.update('id123', {done: true});
 //
 
-function hoodieMemoryStore (hoodie, options) {
-  options = options || {};
+module.exports = function (hoodie, options) {
 
-  var localStore = {};
+  // persistance logic
+  var backend = {};
 
+  // extend this property with extra functions that will be available
+  // on all promises returned by hoodie.store API. It has a reference
+  // to current hoodie instance by default
+  var promiseApi = {
+    hoodie: hoodie
+  };
+
+  // name
+  var storeName = options.name || 'store';
+
+  // public API
+  var api = function api(type, id) {
+    var scopedOptions = $.extend(true, {type: type, id: id}, options);
+    return hoodieScopedStoreApi(hoodie, api, scopedOptions);
+  };
+
+  // add event API
+  Hoodie.events(hoodie, { context: api, namespace: storeName });
+
+
+  // Validate
+  // --------------
+
+  // by default, we only check for a valid type & id.
+  // the validate method can be overwriten by passing
+  // options.validate
   //
-  // state
-  // -------
+  // if `validate` returns nothing, the passed object is
+  // valid. Otherwise it returns an error
   //
+  api.validate = options.validate;
 
-  // the memory cache
-  var cachedObject = {};
+  if (!options.validate) {
+    api.validate = function(object /*, options */) {
 
-  // map of dirty objects by their ids
-  var dirty = {};
+      if (!object) {
+        return Hoodie.Errors.INVALID_ARGUMENTS('no object passed');
+      }
+      if (!isValidType(object.type)) {
+        return Hoodie.Errors.INVALID_KEY({
+          type: object.type
+        });
+      }
 
-  // queue of method calls done during bootstrapping
-  var queue = [];
+      if (!object.id) {
+        return;
+      }
 
-  // 2 seconds timout before triggering the `idle` event
-  var idleTimeout = options.idleTimeout === undefined ? 2000 : options.idleTimeout;
+      if (!isValidId(object.id)) {
+        return Hoodie.Errors.INVALID_KEY({
+          id: object.id
+        });
+      }
+    };
+  }
 
+  // Save
+  // --------------
 
-
-
-  // ------
+  // creates or replaces an an eventually existing object in the store
+  // with same type & id.
   //
-  // saves the passed object into the store and replaces
-  // an eventually existing object with same type & id.
-  //
-  // When id is undefined, it gets generated an new object gets saved
-  //
-  // It also adds timestamps along the way:
-  //
-  // * `createdAt` unless it already exists
-  // * `updatedAt` every time
-  // * `_syncedAt`  if changes comes from remote
+  // When id is undefined, it gets generated and a new object gets saved
   //
   // example usage:
   //
   //     store.save('car', undefined, {color: 'red'})
   //     store.save('car', 'abc4567', {color: 'red'})
   //
-  localStore.save = function save(object, options) {
-    var currentObject, defer, error, event, isNew, key;
+  api.save = function save(type, id, properties, options) {
+
+    if ( options ) {
+      options = $.extend(true, {}, options);
+    } else {
+      options = {};
+    }
+
+    // don't mess with passed object
+    var object = $.extend(true, {}, properties, {type: type, id: id});
+
+    // validations
+    var error = api.validate(object, options || {});
+    if(error) { return rejectWith(error); }
+
+    return decoratePromise( backend.save(object, options || {}) );
+  };
+
+
+  // Add
+  // -------------------
+
+  // `.add` is an alias for `.save`, with the difference that there is no id argument.
+  // Internally it simply calls `.save(type, undefined, object).
+  //
+  api.add = function add(type, properties, options) {
+
+    if (properties === undefined) {
+      properties = {};
+    }
 
     options = options || {};
-
-    // if store is currently bootstrapping data from remote,
-    // we're queueing local saves until it's finished.
-    if (store.isBootstrapping() && !options.remote) {
-      return enqueue('save', arguments);
-    }
-
-    // generate an id if necessary
-    if (object.id) {
-      currentObject = cache(object.type, object.id);
-      isNew = typeof currentObject !== 'object';
-    } else {
-      isNew = true;
-      object.id = hoodie.uuid();
-    }
-
-    if (isNew) {
-      // add createdBy hash
-      object.createdBy = object.createdBy || hoodie.account.ownerHash;
-    }
-    else {
-      // leave createdBy hash
-      if (currentObject.createdBy) {
-        object.createdBy = currentObject.createdBy;
-      }
-    }
-
-    // handle local properties and hidden properties with $ prefix
-    // keep local properties for remote updates
-    if (!isNew) {
-
-      // for remote updates, keep local properties (starting with '_')
-      // for local updates, keep hidden properties (starting with '$')
-      for (key in currentObject) {
-        if (!object.hasOwnProperty(key)) {
-          switch (key.charAt(0)) {
-          case '_':
-            if (options.remote) {
-              object[key] = currentObject[key];
-            }
-            break;
-          case '$':
-            if (!options.remote) {
-              object[key] = currentObject[key];
-            }
-          }
-        }
-      }
-    }
-
-    // add timestamps
-    if (options.remote) {
-      object._syncedAt = now();
-    } else if (!options.silent) {
-      object.updatedAt = now();
-      object.createdAt = object.createdAt || object.updatedAt;
-    }
-
-    // handle local changes
-    //
-    // A local change is meant to be replicated to the
-    // users database, but not beyond. For example when
-    // I subscribed to a share but then decide to unsubscribe,
-    // all objects get removed with local: true flag, so that
-    // they get removed from my database, but won't anywhere else.
-    if (options.local) {
-      object._$local = true;
-    } else {
-      delete object._$local;
-    }
-
-    defer = hoodie.defer();
-
-    try {
-      object = cache(object.type, object.id, object, options);
-      defer.resolve(object, isNew).promise();
-      event = isNew ? 'add' : 'update';
-      triggerEvents(event, object, options);
-    } catch (_error) {
-      error = _error;
-      defer.reject(error.toString());
-    }
-
-    return defer.promise();
+    return api.save(type, properties.id, properties, options);
   };
 
 
   // find
   // ------
 
-  // loads one object from Store, specified by `type` and `id`
   //
-  // example usage:
+  api.find = function find(type, id) {
+
+    return decoratePromise( backend.find(type, id) );
+  };
+
+
+  // find or add
+  // -------------
+
+  // 1. Try to find a share by given id
+  // 2. If share could be found, return it
+  // 3. If not, add one and return it.
   //
-  //     store.find('car', 'abc4567')
-  localStore.find = function(type, id) {
-    var defer, error, object;
+  api.findOrAdd = function findOrAdd(type, id, properties) {
 
-    defer = hoodie.defer();
-
-    // if store is currently bootstrapping data from remote,
-    // we're queueing until it's finished
-    if (store.isBootstrapping()) {
-      return enqueue('find', arguments);
+    if (properties === null) {
+      properties = {};
     }
 
-    try {
-      object = cache(type, id);
-      if (!object) {
-        defer.reject(Hoodie.Errors.NOT_FOUND(type, id)).promise();
-      }
-      defer.resolve(object);
-    } catch (_error) {
-      error = _error;
-      defer.reject(error);
+    function handleNotFound() {
+      var newProperties;
+      newProperties = $.extend(true, {
+        id: id
+      }, properties);
+      return api.add(type, newProperties);
     }
 
-    return defer.promise();
+    // promise decorations get lost when piped through `then`,
+    // that's why we need to decorate the find's promise again.
+    var promise = api.find(type, id).then(null, handleNotFound);
+    return decoratePromise( promise );
   };
 
 
   // findAll
-  // ---------
+  // ------------
 
   // returns all objects from store.
   // Can be optionally filtered by a type or a function
   //
-  // example usage:
+  api.findAll = function findAll(type, options) {
+
+    return decoratePromise( backend.findAll(type, options) );
+  };
+
+
+  // Update
+  // -------------------
+
+  // In contrast to `.save`, the `.update` method does not replace the stored object,
+  // but only changes the passed attributes of an exsting object, if it exists
   //
-  //     store.findAll()
-  //     store.findAll('car')
-  //     store.findAll(function(obj) { return obj.brand == 'Tesla' })
+  // both a hash of key/values or a function that applies the update to the passed
+  // object can be passed.
   //
-  localStore.findAll = function findAll(filter) {
-    var currentType, defer, error, id, key, keys, obj, results, type;
+  // example usage
+  //
+  // hoodie.store.update('car', 'abc4567', {sold: true})
+  // hoodie.store.update('car', 'abc4567', function(obj) { obj.sold = true })
+  //
+  api.update = function update(type, id, objectUpdate, options) {
 
-    if (filter == null) {
-      filter = function() {
-        return true;
-      };
-    }
+    function handleFound(currentObject) {
+      var changedProperties, newObj, value;
 
-    // if store is currently bootstrapping data from remote,
-    // we're queueing until it's finished
-    if (store.isBootstrapping()) {
-      return enqueue('findAll', arguments);
-    }
+      // normalize input
+      newObj = $.extend(true, {}, currentObject);
 
-    keys = store.index();
+      if (typeof objectUpdate === 'function') {
+        objectUpdate = objectUpdate(newObj);
+      }
 
-    // normalize filter
-    if (typeof filter === 'string') {
-      type = filter;
-      filter = function(obj) {
-        return obj.type === type;
-      };
-    }
+      if (!objectUpdate) {
+        return resolveWith(currentObject);
+      }
 
-    defer = hoodie.defer();
+      // check if something changed
+      changedProperties = (function() {
+        var _results = [];
 
-    try {
-
-      //
-      results = (function() {
-        var _i, _len, _ref, _results;
-        _results = [];
-        for (_i = 0, _len = keys.length; _i < _len; _i++) {
-          key = keys[_i];
-          if (!(isSemanticId(key))) {
-            continue;
-          }
-          _ref = key.split('/');
-          currentType = _ref[0];
-          id = _ref[1];
-
-          obj = cache(currentType, id);
-          if (obj && filter(obj)) {
-            _results.push(obj);
+        for (var key in objectUpdate) {
+          if (objectUpdate.hasOwnProperty(key)) {
+            value = objectUpdate[key];
+            if ((currentObject[key] !== value) === false) {
+              continue;
+            }
+            // workaround for undefined values, as $.extend ignores these
+            newObj[key] = value;
+            _results.push(key);
           }
         }
         return _results;
-      }).call(this);
+      })();
 
-      // sort from newest to oldest
-      results.sort(function(a, b) {
-        if (a.createdAt > b.createdAt) {
-          return -1;
-        } else if (a.createdAt < b.createdAt) {
-          return 1;
-        } else {
-          return 0;
-        }
-      });
-      defer.resolve(results).promise();
-    } catch (_error) {
-      error = _error;
-      defer.reject(error).promise();
+      if (!(changedProperties.length || options)) {
+        return resolveWith(newObj);
+      }
+
+      //apply update
+      return api.save(type, id, newObj, options);
     }
-    return defer.promise();
+
+    // promise decorations get lost when piped through `then`,
+    // that's why we need to decorate the find's promise again.
+    var promise = api.find(type, id).then(handleFound);
+    return decoratePromise( promise );
+  };
+
+
+  // updateOrAdd
+  // -------------
+
+  // same as `.update()`, but in case the object cannot be found,
+  // it gets created
+  //
+  api.updateOrAdd = function updateOrAdd(type, id, objectUpdate, options) {
+    function handleNotFound() {
+      var properties = $.extend(true, {}, objectUpdate, {id: id});
+      return api.add(type, properties, options);
+    }
+
+    var promise = api.update(type, id, objectUpdate, options).then(null, handleNotFound);
+    return decoratePromise( promise );
+  };
+
+
+  // updateAll
+  // -----------------
+
+  // update all objects in the store, can be optionally filtered by a function
+  // As an alternative, an array of objects can be passed
+  //
+  // example usage
+  //
+  // hoodie.store.updateAll()
+  //
+  api.updateAll = function updateAll(filterOrObjects, objectUpdate, options) {
+    var promise;
+
+    options = options || {};
+
+    // normalize the input: make sure we have all objects
+    switch (true) {
+    case typeof filterOrObjects === 'string':
+      promise = api.findAll(filterOrObjects);
+      break;
+    case hoodie.isPromise(filterOrObjects):
+      promise = filterOrObjects;
+      break;
+    case $.isArray(filterOrObjects):
+      promise = hoodie.defer().resolve(filterOrObjects).promise();
+      break;
+    default: // e.g. null, update all
+      promise = api.findAll();
+    }
+
+    promise = promise.then(function(objects) {
+      // now we update all objects one by one and return a promise
+      // that will be resolved once all updates have been finished
+      var object, _updatePromises;
+
+      if (!$.isArray(objects)) {
+        objects = [objects];
+      }
+
+      _updatePromises = (function() {
+        var _i, _len, _results;
+        _results = [];
+        for (_i = 0, _len = objects.length; _i < _len; _i++) {
+          object = objects[_i];
+          _results.push(api.update(object.type, object.id, objectUpdate, options));
+        }
+        return _results;
+      })();
+
+      return $.when.apply(null, _updatePromises);
+    });
+
+    return decoratePromise( promise );
   };
 
 
   // Remove
-  // --------
+  // ------------
 
   // Removes one object specified by `type` and `id`.
   //
   // when object has been synced before, mark it as deleted.
   // Otherwise remove it from Store.
-  localStore.remove = function remove(type, id, options) {
-    var key, object, objectWasMarkedAsDeleted;
-
-    options = options || {};
-
-    // if store is currently bootstrapping data from remote,
-    // we're queueing local removes until it's finished.
-    if (store.isBootstrapping() && !options.remote) {
-      return enqueue('remove', arguments);
-    }
-
-    key = type + '/' + id;
-
-    object = cache(type, id);
-
-    // if change comes from remote, just clean up locally
-    if (options.remote) {
-      objectWasMarkedAsDeleted = cachedObject[key] && isMarkedAsDeleted(cachedObject[key]);
-      cachedObject[key] = false;
-      clearChanged(type, id);
-      if (objectWasMarkedAsDeleted && object) {
-        return hoodie.resolveWith(object);
-      }
-    }
-
-    if (!object) {
-      return hoodie.rejectWith(Hoodie.Errors.NOT_FOUND(type, id));
-    }
-
-    if (object._syncedAt) {
-      object._deleted = true;
-      cache(type, id, object);
-    } else {
-      key = type + '/' + id;
-      cachedObject[key] = false;
-      clearChanged(type, id);
-    }
-
-    // https://github.com/hoodiehq/hoodie.js/issues/147
-    if (options.update) {
-      object = options.update;
-      delete options.update;
-    }
-    triggerEvents('remove', object, options);
-    return hoodie.resolveWith(object);
+  //
+  api.remove = function remove(type, id, options) {
+    return decoratePromise( backend.remove(type, id, options || {}) );
   };
 
 
-  // Remove all
-  // ----------
+  // removeAll
+  // -----------
 
-  // Removes one object specified by `type` and `id`.
+  // Destroye all objects. Can be filtered by a type
   //
-  // when object has been synced before, mark it as deleted.
-  // Otherwise remove it from Store.
-  localStore.removeAll = function removeAll(type, options) {
-    return store.findAll(type).then(function(objects) {
-      var object, _i, _len, results;
-
-      results = [];
-
-      for (_i = 0, _len = objects.length; _i < _len; _i++) {
-        object = objects[_i];
-        results.push(store.remove(object.type, object.id, options));
-      }
-      return results;
-    });
+  api.removeAll = function removeAll(type, options) {
+    return decoratePromise( backend.removeAll(type, options || {}) );
   };
 
 
-  // validate
-  // ----------
+  // decorate promises
+  // -------------------
 
-  //
-  function validate (object) {
+  // extend promises returned by store.api
+  api.decoratePromises = function decoratePromises(methods) {
+    return $.extend(promiseApi, methods);
+  };
 
-    if (!isValidType(object.type)) {
-      return Hoodie.Errors.INVALID_KEY({
-        type: object.type
-      });
-    }
 
-    if (arguments.length > 0 && !isValidId(object.id)) {
-      return Hoodie.Errors.INVALID_KEY({
-        id: object.id
-      });
-    }
+
+  // required backend methods
+  // -------------------------
+  if (!options.backend ) {
+    throw new Error('options.backend must be passed');
   }
 
-  var store = hoodieStoreApi(hoodie, {
+  var required = 'save find findAll remove removeAll'.split(' ');
 
-    // validate
-    validate: validate,
+  required.forEach( function(methodName) {
 
-    backend: {
-      save: localStore.save,
-      find: localStore.find,
-      findAll: localStore.findAll,
-      remove: localStore.remove,
-      removeAll: localStore.removeAll
+    if (!options.backend[methodName]) {
+      throw new Error('options.backend.'+methodName+' must be passed.');
     }
+
+    backend[methodName] = options.backend[methodName];
   });
 
 
+  // Private
+  // ---------
 
-  // extended public API
-  // ---------------------
-
-
-  // index
-  // -------
-
-  // object key index
-  // TODO: make this cachy
-  store.index = function index() {
-    var keys = [];
-    for (var key in cachedObject) {
-      if (cachedObject.hasOwnProperty(key) && isSemanticId(key)) {
-        keys.push(key);
-      }
-    }
-    return keys;
-  };
-
-
-  // changed objects
-  // -----------------
-
-  // returns an Array of all dirty documents
-  store.changedObjects = function changedObjects() {
-    var id, key, object, type, _ref, _ref1, _results;
-
-    _ref = dirty;
-    _results = [];
-
-    for (key in _ref) {
-      if (_ref.hasOwnProperty(key)) {
-        object = _ref[key];
-        _ref1 = key.split('/');
-        type = _ref1[0];
-        id = _ref1[1];
-        object.type = type;
-        object.id = id;
-        _results.push(object);
-      }
-    }
-    return _results;
-  };
-
-
-  // Is dirty?
-  // ----------
-
-  // When no arguments passed, returns `true` or `false` depending on if there are
-  // dirty objects in the store.
-  //
-  // Otherwise it returns `true` or `false` for the passed object. An object is dirty
-  // if it has no `_syncedAt` attribute or if `updatedAt` is more recent than `_syncedAt`
-  store.hasLocalChanges = function(type, id) {
-    function isEmptyObject (obj) {
-      for (var key in obj) {
-        if (Object.prototype.hasOwnProperty.call(obj, key)) return false;
-      }
-      return true;
-    }
-
-    if (!type) {
-      return !isEmptyObject(dirty);
-    }
-    var key = [type,id].join('/');
-    if (dirty[key]) {
-      return true;
-    }
-    return hasLocalChanges(cache(type, id));
-  };
-
-
-  // Clear
-  // ------
-
-  // clears localStorage and cache
-  // TODO: do not clear entire localStorage, clear only the items that have been stored
-  //       using `hoodie.store` before.
-  store.clear = function clear() {
-    var defer = hoodie.defer();
-    try {
-      cachedObject = {};
-      clearChanged();
-      defer.resolve();
-      store.trigger('clear');
-    } catch (_error) {
-      defer.reject(_error);
-    }
-    return defer.promise();
-  };
-
-
-  // isBootstrapping
-  // -----------------
-
-  // returns true if store is currently bootstrapping data from remote,
-  // otherwise false.
-  var bootstrapping = false;
-  store.isBootstrapping = function isBootstrapping() {
-    return bootstrapping;
-  };
-
-
-
-
-  //
-  // Private methods
-  // -----------------
-  //
-
-
-  // Cache
-  // -------
-
-  // loads an object specified by `type` and `id`
-  // and caches it for faster future access. Updates cache when `value` is passed.
-  //
-  // Also checks if object needs to be synched (dirty) or not
-  //
-  // Pass `options.remote = true` when object comes from remote
-  // Pass 'options.silent = true' to avoid events from being triggered.
-  function cache(type, id, object, options) {
-    var key;
-
-    if (object === undefined) {
-      object = false;
-    }
-
-    options = options || {};
-    key = '' + type + '/' + id;
-
-    if (object) {
-      extend(object, {
-        type: type,
-        id: id
-      });
-
-      if (options.remote) {
-        clearChanged(type, id);
-        cachedObject[key] = extend(true, {}, object);
-        return cachedObject[key];
-      }
-
-    } else {
-
-      // if the cached key returns false, it means
-      // that we have removed that key. We just
-      // set it to false for performance reasons, so
-      // that we don't need to look it up again in localStorage
-      if (cachedObject[key] === false) {
-        return false;
-      }
-
-      // if key is cached, return it. But make sure
-      // to make a deep copy beforehand (=> true)
-      if (cachedObject[key]) {
-        return extend(true, {}, cachedObject[key]);
-      }
-
-      // stop here if object did not exist
-      // and cache it so we don't need to look it up again
-      if (object === false) {
-        clearChanged(type, id);
-        cachedObject[key] = false;
-        return false;
-      }
-
-    }
-
-    if (isMarkedAsDeleted(object)) {
-      markAsChanged(type, id, object, options);
-      cachedObject[key] = false;
-      return false;
-    }
-
-    // here is where we cache the object for
-    // future quick access
-    cachedObject[key] = extend(true, {}, object);
-
-    if (hasLocalChanges(object)) {
-      markAsChanged(type, id, cachedObject[key], options);
-    } else {
-      clearChanged(type, id);
-    }
-
-    return extend(true, {}, object);
+  // / not allowed for id
+  var validIdPattern = new RegExp(/^[^\/]+$/);
+  function isValidId(key) {
+    return validIdPattern.test(key || '');
   }
 
-
-  //
-  // subscribe to events coming from our remote store.
-  //
-  function subscribeToOutsideEvents() {
-    if (!options.remote) {
-      return;
-    }
-
-    options.remote.on('bootstrap:start', startBootstrappingMode);
-    options.remote.on('bootstrap:end', endBootstrappingMode);
-    options.remote.on('change', handleRemoteChange);
-    options.remote.on('push', handlePushedObject);
-
-    function onConnect () {
-      store.on('idle', options.remote.push);
-      options.remote.push();
-    }
-
-    if (options.remote.isConnected()) {
-      onConnect()
-    }
-
-    options.remote.on('connect', onConnect);
-
-    options.remote.on('disconnect', function() {
-      store.unbind('idle', options.remote.push);
-    });
-
-    hoodie.on('disconnected', options.remote.disconnect);
-    hoodie.on('reconnected', options.remote.connect);
-  }
-
-  // allow to run this once from outside
-  store.subscribeToOutsideEvents = function() {
-    subscribeToOutsideEvents();
-    delete store.subscribeToOutsideEvents;
-  };
-
-
-  //
-  // Marks object as changed (dirty). Triggers a `store:dirty` event immediately and a
-  // `store:idle` event once there is no change within 2 seconds
-  //
-  function markAsChanged(type, id, object, options) {
-    var key;
-
-    options = options || {};
-    key = '' + type + '/' + id;
-
-    dirty[key] = object;
-
-    if (options.silent) {
-      return;
-    }
-
-    triggerDirtyAndIdleEvents();
-  }
-
-  // Clear changed
-  // ---------------
-
-  // removes an object from the list of objects that are flagged to by synched (dirty)
-  // and triggers a `store:dirty` event
-  function clearChanged(type, id) {
-    if (type && id) {
-      delete dirty['' + type + '/' + id];
-    } else {
-      dirty = {};
-    }
-    return window.clearTimeout(dirtyTimeout);
-  }
-
-
-  // when a change come's from our remote store, we differentiate
-  // whether an object has been removed or added / updated and
-  // reflect the change in our local store.
-  function handleRemoteChange(typeOfChange, object) {
-    if (typeOfChange === 'remove') {
-      store.remove(object.type, object.id, {
-        remote: true,
-        update: object
-      });
-    } else {
-      store.save(object.type, object.id, object, {
-        remote: true
-      });
-    }
-  }
-
-
-  //
-  // all local changes get bulk pushed. For each object with local
-  // changes that has been pushed we  trigger a sync event
-  function handlePushedObject(object) {
-    triggerEvents('sync', object);
+  // / not allowed for type
+  var validTypePattern = new RegExp(/^[^\/]+$/);
+  function isValidType(key) {
+    return validTypePattern.test(key || '');
   }
 
   //
-  function now() {
-    return JSON.stringify(new Date()).replace(/['"]/g, '');
+  function decoratePromise(promise) {
+    return $.extend(promise, promiseApi);
   }
 
-  // only lowercase letters, numbers and dashes are allowed for ids
-  var validIdPattern = /^[a-z0-9\-]+$/;
-  function isValidId(id) {
-    return validIdPattern.test(id);
+  function resolveWith() {
+    var promise = hoodie.resolveWith.apply(null, arguments);
+    return decoratePromise(promise);
   }
 
-  // just like ids, but must start with a letter or a $ (internal types)
-  var validTypePattern = /^[a-z$][a-z0-9]+$/;
-  function isValidType(type) {
-    return validTypePattern.test(type);
+  function rejectWith() {
+    var promise = hoodie.rejectWith.apply(null, arguments);
+    return decoratePromise(promise);
   }
 
-  //
-  var semanticIdPattern = /^[a-z$][a-z0-9]+\/[a-z0-9]+$/;
-  function isSemanticId(key) {
-    return semanticIdPattern.test(key);
-  }
-
-  // `hasLocalChanges` returns true if there is a local change that
-  // has not been sync'd yet.
-  function hasLocalChanges(object) {
-    if (!object.updatedAt) {
-      return false;
-    }
-    if (!object._syncedAt) {
-      return true;
-    }
-    return object._syncedAt < object.updatedAt;
-  }
-
-  //
-  function isMarkedAsDeleted(object) {
-    return object._deleted === true;
-  }
-
-  // this is where all the store events get triggered,
-  // like add:task, change:note:abc4567, remove, etc.
-  function triggerEvents(eventName, object, options) {
-    store.trigger(eventName, extend(true, {}, object), options);
-    store.trigger(object.type + ':' + eventName, extend(true, {}, object), options);
-
-    if (eventName !== 'new') {
-      store.trigger( object.type + ':' + object.id+ ':' + eventName, extend(true, {}, object), options);
-    }
-
-    // sync events have no changes, so we don't trigger
-    // "change" events.
-    if (eventName === 'sync') {
-      return;
-    }
-
-    store.trigger('change', eventName, extend(true, {}, object), options);
-    store.trigger(object.type + ':change', eventName, extend(true, {}, object), options);
-
-    if (eventName !== 'new') {
-      store.trigger(object.type + ':' + object.id + ':change', eventName, extend(true, {}, object), options);
-    }
-  }
-
-  // when an object gets changed, two special events get triggerd:
-  //
-  // 1. dirty event
-  //    the `dirty` event gets triggered immediately, for every
-  //    change that happens.
-  // 2. idle event
-  //    the `idle` event gets triggered after a short timeout of
-  //    no changes, e.g. 2 seconds.
-  var dirtyTimeout;
-  function triggerDirtyAndIdleEvents() {
-    store.trigger('dirty');
-    window.clearTimeout(dirtyTimeout);
-
-    dirtyTimeout = window.setTimeout(function() {
-      store.trigger('idle', store.changedObjects());
-    }, idleTimeout);
-  }
-
-  //
-  function startBootstrappingMode() {
-    bootstrapping = true;
-    store.trigger('bootstrap:start');
-  }
-
-  //
-  function endBootstrappingMode() {
-    var methodCall, method, args, defer;
-
-    bootstrapping = false;
-    while(queue.length > 0) {
-      methodCall = queue.shift();
-      method = methodCall[0];
-      args = methodCall[1];
-      defer = methodCall[2];
-      localStore[method].apply(localStore, args).then(defer.resolve, defer.reject);
-    }
-
-    store.trigger('bootstrap:end');
-  }
-
-  //
-  function enqueue(method, args) {
-    var defer = hoodie.defer();
-    queue.push([method, args, defer]);
-    return defer.promise();
-  }
-
-  //
-  // expose public API
-  //
-  // inherit from Hoodies Store API
-  return store;
+  return api;
 }
-
-Hoodie.extend(function (hoodie) {
-  hoodie.memory = hoodie.memory || {};
-  hoodie.memory.open = function (name, options) {
-    var store = hoodieMemoryStore(hoodie, options);
-    store.subscribeToOutsideEvents();
-    return store;
-  };
-});
